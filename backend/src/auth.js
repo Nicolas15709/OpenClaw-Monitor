@@ -29,6 +29,10 @@ export function destroySession(sessionId) {
   db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId)
 }
 
+export function clearExpiredSessions() {
+  return db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(new Date().toISOString()).changes
+}
+
 export function getSessionFromRequest(req) {
   const cookies = parseCookie(req.headers.cookie || '')
   const sessionId = cookies[SESSION_COOKIE]

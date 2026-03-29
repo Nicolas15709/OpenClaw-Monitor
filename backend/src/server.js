@@ -6,6 +6,7 @@ import rateLimit from '@fastify/rate-limit'
 import crypto from 'node:crypto'
 import { db } from './db.js'
 import {
+  clearExpiredSessions,
   clearSessionCookie,
   createSession,
   destroySession,
@@ -13,7 +14,7 @@ import {
   sessionCookie,
   verifyPassword,
 } from './auth.js'
-import { getTelemetrySnapshot } from './telemetry.js'
+import { getSystemHealthReport, getTelemetrySnapshot } from './telemetry.js'
 
 const app = Fastify({ logger: false })
 const host = process.env.MONITOR_API_HOST || '127.0.0.1'
@@ -22,6 +23,17 @@ const allowedOrigin = process.env.MONITOR_ALLOWED_ORIGIN || 'http://127.0.0.1:41
 const secureCookie = process.env.MONITOR_COOKIE_SECURE === 'true'
 const sessionSecret = process.env.MONITOR_SESSION_SECRET || crypto.randomBytes(32).toString('hex')
 void sessionSecret
+
+function startupCheck() {
+  const warnings = []
+  if (!process.env.MONITOR_SESSION_SECRET || process.env.MONITOR_SESSION_SECRET === 'change-this-to-a-long-random-secret') {
+    warnings.push('MONITOR_SESSION_SECRET is using a temporary or default value.')
+  }
+  if (!secureCookie) {
+    warnings.push('MONITOR_COOKIE_SECURE=false; use true behind HTTPS/Tailscale serve.')
+  }
+  return warnings
+}
 
 await app.register(helmet, {
   contentSecurityPolicy: false,
@@ -55,7 +67,18 @@ function requireAuth(req, reply) {
   return true
 }
 
-app.get('/health', async () => ({ ok: true }))
+app.get('/health', async () => {
+  const report = await getSystemHealthReport()
+  return report
+})
+
+app.get('/health/ready', async (req, reply) => {
+  const report = await getSystemHealthReport()
+  if (!report.ok) {
+    return reply.code(503).send(report)
+  }
+  return report
+})
 
 app.post('/auth/login', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (req, reply) => {
   const { username, password } = req.body || {}
@@ -101,6 +124,15 @@ app.setErrorHandler((error, req, reply) => {
   const code = error?.statusCode && Number.isInteger(error.statusCode) ? error.statusCode : 500
   reply.code(code).send({ error: code === 500 ? 'internal_error' : error.message })
 })
+
+const startupWarnings = startupCheck()
+const expiredSessionsCleared = clearExpiredSessions()
+if (expiredSessionsCleared > 0) {
+  console.log(`openclaw-monitor-api cleared ${expiredSessionsCleared} expired session(s) on startup`)
+}
+for (const warning of startupWarnings) {
+  console.warn(`openclaw-monitor-api startup warning: ${warning}`)
+}
 
 app.listen({ host, port }).then(() => {
   console.log(`openclaw-monitor-api listening on http://${host}:${port}`)

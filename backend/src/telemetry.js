@@ -1,7 +1,9 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { db } from './db.js'
 
 const execFileAsync = promisify(execFile)
+const CLI_TIMEOUT_MS = Number(process.env.MONITOR_CLI_TIMEOUT_MS || 15000)
 
 function sanitizeText(value) {
   return String(value || '')
@@ -11,13 +13,39 @@ function sanitizeText(value) {
 }
 
 async function runOpenClaw(args) {
-  const { stdout } = await execFileAsync('openclaw', args, { maxBuffer: 1024 * 1024 * 4 })
+  const { stdout } = await execFileAsync('openclaw', args, {
+    maxBuffer: 1024 * 1024 * 4,
+    timeout: CLI_TIMEOUT_MS,
+  })
   return sanitizeText(stdout)
 }
 
 async function runOpenClawJson(args) {
-  const { stdout } = await execFileAsync('openclaw', args, { maxBuffer: 1024 * 1024 * 4 })
+  const { stdout } = await execFileAsync('openclaw', args, {
+    maxBuffer: 1024 * 1024 * 4,
+    timeout: CLI_TIMEOUT_MS,
+  })
   return JSON.parse(stdout)
+}
+
+async function runCheck(name, runner) {
+  const startedAt = Date.now()
+  try {
+    const value = await runner()
+    return {
+      name,
+      ok: true,
+      durationMs: Date.now() - startedAt,
+      value,
+    }
+  } catch (error) {
+    return {
+      name,
+      ok: false,
+      durationMs: Date.now() - startedAt,
+      error: sanitizeText(error?.message || 'unknown_error'),
+    }
+  }
 }
 
 function formatAgeFromMs(ageMs) {
@@ -79,14 +107,15 @@ function mapCronJob(job) {
   }
 }
 
-function buildOverview(statusText, sessions, cronJobs) {
+function buildOverview(statusText, sessions, cronJobs, checks) {
   const activeSessions = sessions.filter((s) => s.state === 'active').length
   const totalVisibleTokens = sessions.reduce((sum, s) => sum + (s.tokens || 0), 0)
   const errors = cronJobs.filter((j) => j.status === 'error').length
   const mainKind = sessions.find((s) => s.kind === 'main')?.kind || sessions[0]?.kind || 'unknown'
+  const failedChecks = checks.filter((check) => !check.ok).length
 
   return {
-    status: /reachable|running/i.test(statusText) ? 'online' : 'degraded',
+    status: failedChecks === 0 && /reachable|running/i.test(statusText) ? 'online' : failedChecks === checks.length ? 'offline' : 'degraded',
     runtime: 'OpenClaw main',
     channel: mainKind,
     activeSessions,
@@ -113,12 +142,43 @@ function buildTimeline(statusText, cronJobs, sessions) {
   return items.slice(0, 10)
 }
 
+function getDbHealth() {
+  try {
+    const row = db.prepare('SELECT 1 AS ok').get()
+    return {
+      ok: row?.ok === 1,
+      engine: 'sqlite',
+      sessionCount: db.prepare('SELECT COUNT(*) AS count FROM sessions').get()?.count || 0,
+      userCount: db.prepare('SELECT COUNT(*) AS count FROM users').get()?.count || 0,
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      engine: 'sqlite',
+      error: sanitizeText(error?.message || 'db_unavailable'),
+    }
+  }
+}
+
+function summarizeChecks(checks) {
+  return checks.map((check) => ({
+    name: check.name,
+    ok: check.ok,
+    durationMs: check.durationMs,
+    error: check.ok ? undefined : check.error,
+  }))
+}
+
 export async function getTelemetrySnapshot() {
-  const [statusText, sessionsResult, cronResult] = await Promise.all([
-    runOpenClaw(['status']),
-    runOpenClawJson(['sessions', '--json', '--all-agents']).catch(() => ({ sessions: [] })),
-    runOpenClawJson(['cron', 'list', '--json']).catch(() => ({ jobs: [] })),
+  const checks = await Promise.all([
+    runCheck('openclaw_status', () => runOpenClaw(['status'])),
+    runCheck('openclaw_sessions', () => runOpenClawJson(['sessions', '--json', '--all-agents'])),
+    runCheck('openclaw_cron', () => runOpenClawJson(['cron', 'list', '--json'])),
   ])
+
+  const statusText = checks.find((check) => check.name === 'openclaw_status')?.value || ''
+  const sessionsResult = checks.find((check) => check.name === 'openclaw_sessions')?.value || { sessions: [] }
+  const cronResult = checks.find((check) => check.name === 'openclaw_cron')?.value || { jobs: [] }
 
   const rawSessions = Array.isArray(sessionsResult?.sessions) ? sessionsResult.sessions : []
   const rawCron = Array.isArray(cronResult?.jobs) ? cronResult.jobs : []
@@ -129,7 +189,7 @@ export async function getTelemetrySnapshot() {
     .map(mapSession)
 
   const cron = rawCron.slice(0, 8).map(mapCronJob)
-  const overview = buildOverview(statusText, activeWork, cron)
+  const overview = buildOverview(statusText, activeWork, cron, checks)
   const timeline = buildTimeline(statusText, cron, activeWork)
 
   return {
@@ -140,9 +200,51 @@ export async function getTelemetrySnapshot() {
     cron,
     timeline,
     statusText,
+    healthChecks: summarizeChecks(checks),
     warnings: [
       'Telemetry is sanitized and read-only.',
       'Sensitive values are redacted before returning to the frontend.',
     ],
+  }
+}
+
+export async function getSystemHealthReport() {
+  const [statusCheck, sessionsCheck, cronCheck] = await Promise.all([
+    runCheck('openclaw_status', () => runOpenClaw(['status'])),
+    runCheck('openclaw_sessions', () => runOpenClawJson(['sessions', '--json', '--all-agents'])),
+    runCheck('openclaw_cron', () => runOpenClawJson(['cron', 'list', '--json'])),
+  ])
+
+  const dbHealth = getDbHealth()
+  const checks = [
+    {
+      name: 'database',
+      ok: dbHealth.ok,
+      durationMs: 0,
+      error: dbHealth.ok ? undefined : dbHealth.error,
+    },
+    statusCheck,
+    sessionsCheck,
+    cronCheck,
+  ]
+
+  const sessions = Array.isArray(sessionsCheck.value?.sessions) ? sessionsCheck.value.sessions : []
+  const jobs = Array.isArray(cronCheck.value?.jobs) ? cronCheck.value.jobs : []
+  const cronErrors = jobs.filter((job) => (job.state?.lastRunStatus || job.state?.lastStatus) === 'error').length
+  const activeSessions = sessions.filter((session) => Number(session.ageMs || 0) < 1000 * 60 * 20).length
+  const failedChecks = checks.filter((check) => !check.ok)
+
+  return {
+    ok: failedChecks.length === 0,
+    status: failedChecks.length === 0 ? 'ok' : failedChecks.length === checks.length ? 'offline' : 'degraded',
+    generatedAt: new Date().toISOString(),
+    summary: {
+      activeSessions,
+      configuredCronJobs: jobs.length,
+      cronErrors,
+      users: dbHealth.userCount || 0,
+      sessionsStored: dbHealth.sessionCount || 0,
+    },
+    checks: summarizeChecks(checks),
   }
 }

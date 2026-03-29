@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "seed-admin": "node src/seed-admin.js"
+    "seed-admin": "node src/seed-admin.js",
+    "smoke": "node --input-type=module -e \"const base=process.env.MONITOR_SMOKE_URL||'http://127.0.0.1:4180'; const res=await fetch(base+'/health'); if(!res.ok){throw new Error('health_check_failed:'+res.status)} const json=await res.json(); if(!json?.status){throw new Error('missing_status')} console.log('health ok:', json.status)\""
   },
   "dependencies": {
     "argon2": "^0.41.1",
